@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -42,7 +43,7 @@ class BeltBagInventoryGUI : public InventoryGUI
 public:
     static BeltBagInventoryGUI* Create(Inventory* inv, InventoryLayout* layout, RootObject* callback)
     {
-        void* mem = ::operator new(sizeof(InventoryGUI));
+        void* mem = Ogre::GeneralAllocatedObject::operator new(sizeof(InventoryGUI));
         BeltBagInventoryGUI* gui = static_cast<BeltBagInventoryGUI*>(mem);
         gui->_CONSTRUCTOR(inv, layout, callback);
         return gui;
@@ -51,7 +52,7 @@ public:
     void Destroy()
     {
         this->_DESTRUCTOR();
-        ::operator delete(this);
+        Ogre::GeneralAllocatedObject::operator delete(this);
     }
 };
 
@@ -64,6 +65,130 @@ namespace
     bool  g_luaRegistered       = false;
     std::vector<std::string> g_beltContainerFilter;
 
+    volatile LONG g_worldTransitionDepth = 0;
+
+    // Diagnostico de crash en %TEMP%
+    const char*   g_currentHook = "none";
+    const char*   g_lastHook    = "none";
+    PVOID         g_vehHandle   = NULL;
+    volatile LONG g_crashLogged = 0;
+
+    struct HookScope
+    {
+        const char* prev;
+        HookScope(const char* name) : prev(g_currentHook)
+        {
+            g_currentHook = name;
+            g_lastHook    = name;
+        }
+        ~HookScope()
+        {
+            g_currentHook = prev;
+        }
+    };
+
+    void FormatAddressModule(void* addr, char* outBuf, size_t outSize)
+    {
+        HMODULE hMod = NULL;
+        if (addr && GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCSTR>(addr),
+            &hMod) && hMod)
+        {
+            char modPath[MAX_PATH] = { 0 };
+            GetModuleFileNameA(hMod, modPath, MAX_PATH);
+            const char* fileName = strrchr(modPath, '\\');
+            fileName = fileName ? (fileName + 1) : modPath;
+            uintptr_t offset = reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(hMod);
+            sprintf_s(outBuf, outSize, "%s + 0x%llX (0x%p)", fileName, static_cast<unsigned long long>(offset), addr);
+        }
+        else
+        {
+            sprintf_s(outBuf, outSize, "0x%p", addr);
+        }
+    }
+
+    LONG CALLBACK VectoredCrashLogger(PEXCEPTION_POINTERS ep)
+    {
+        if (!ep || !ep->ExceptionRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        DWORD code = ep->ExceptionRecord->ExceptionCode;
+        if (code != EXCEPTION_ACCESS_VIOLATION &&
+            code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+            code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+            code != EXCEPTION_STACK_OVERFLOW &&
+            code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED &&
+            code != 0xC0000409)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        if (InterlockedCompareExchange(&g_crashLogged, 1, 0) != 0)
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        char tempDir[MAX_PATH] = { 0 };
+        char logPath[MAX_PATH] = { 0 };
+        if (GetTempPathA(MAX_PATH, tempDir) > 0)
+            sprintf_s(logPath, sizeof(logPath), "%sBeltBagAndCraft_crash.log", tempDir);
+        else
+            strcpy_s(logPath, sizeof(logPath), "BeltBagAndCraft_crash.log");
+
+        FILE* f = NULL;
+        if (fopen_s(&f, logPath, "w") == 0 && f)
+        {
+            char faultLoc[512] = { 0 };
+            FormatAddressModule(ep->ExceptionRecord->ExceptionAddress, faultLoc, sizeof(faultLoc));
+
+            fprintf(f, "=== BeltBagAndCraft Crash Report ===\n");
+            fprintf(f, "Exception Code : 0x%08lX\n", code);
+            fprintf(f, "Fault Address  : %s\n", faultLoc);
+            fprintf(f, "Active Hook    : %s\n", g_currentHook ? g_currentHook : "null");
+            fprintf(f, "Last Hook      : %s\n", g_lastHook ? g_lastHook : "null");
+
+            if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+            {
+                fprintf(f, "AV Operation   : %s at 0x%llX\n",
+                    ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "READ" :
+                    (ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "WRITE" : "EXEC"),
+                    static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[1]));
+            }
+
+            if (ep->ContextRecord)
+            {
+                fprintf(f, "\n--- Stack Return Addresses ---\n");
+                uintptr_t* rsp = reinterpret_cast<uintptr_t*>(ep->ContextRecord->Rsp);
+                int found = 0;
+                for (int i = 0; i < 96 && found < 20; ++i)
+                {
+                    if (IsBadReadPtr(&rsp[i], sizeof(uintptr_t)))
+                        break;
+
+                    void* candidate = reinterpret_cast<void*>(rsp[i]);
+                    HMODULE hMod = NULL;
+                    if (candidate && GetModuleHandleExA(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        static_cast<LPCSTR>(candidate),
+                        &hMod) && hMod)
+                    {
+                        char frameLoc[512] = { 0 };
+                        FormatAddressModule(candidate, frameLoc, sizeof(frameLoc));
+                        fprintf(f, "  [%02d] %s\n", found++, frameLoc);
+                    }
+                }
+            }
+
+            fflush(f);
+            fclose(f);
+        }
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const int MAX_TRACKED_BELT_INVS = 128;
+    const Inventory* g_knownBeltInvs[MAX_TRACKED_BELT_INVS] = { NULL };
+    LONG g_knownBeltInvCursor = 0;
+
     __declspec(thread) bool t_searchingBeltFood = false;
     __declspec(thread) bool t_routingBeltFood   = false;
 
@@ -71,8 +196,60 @@ namespace
     ContainerItem*       g_activeBeltBag = NULL;
     InventoryGUI*        g_parentCharGUI = NULL;
 
+    bool IsWorldTransitioning()
+    {
+        return InterlockedCompareExchange(&g_worldTransitionDepth, 0, 0) > 0;
+    }
+
+    void ClearTrackedBeltInventories()
+    {
+        memset(const_cast<Inventory**>(g_knownBeltInvs), 0, sizeof(g_knownBeltInvs));
+        g_knownBeltInvCursor = 0;
+    }
+
+    void TrackBeltInventory(const Inventory* inv)
+    {
+        if (!inv)
+            return;
+
+        for (int i = 0; i < MAX_TRACKED_BELT_INVS; ++i)
+        {
+            if (g_knownBeltInvs[i] == inv)
+                return;
+        }
+
+        LONG idx = InterlockedIncrement(&g_knownBeltInvCursor) - 1;
+        g_knownBeltInvs[static_cast<unsigned long>(idx) % MAX_TRACKED_BELT_INVS] = inv;
+    }
+
+    bool IsTrackedBeltInventory(const Inventory* inv)
+    {
+        if (!inv)
+            return false;
+
+        if (g_activeBeltBag && g_activeBeltBag->getInventory() == inv)
+            return true;
+
+        for (int i = 0; i < MAX_TRACKED_BELT_INVS; ++i)
+        {
+            if (g_knownBeltInvs[i] == inv)
+                return true;
+        }
+        return false;
+    }
+
+    void ResetBeltGUIStateOnly()
+    {
+        g_activeBeltGUI = NULL;
+        g_activeBeltBag = NULL;
+        g_parentCharGUI = NULL;
+    }
+
     void RefreshActiveBeltGUI(Inventory* modifiedInv)
     {
+        if (IsWorldTransitioning() || !modifiedInv)
+            return;
+
         if (g_activeBeltGUI && g_activeBeltBag && modifiedInv == g_activeBeltBag->getInventory())
         {
             g_activeBeltGUI->refreshSection();
@@ -81,14 +258,14 @@ namespace
 
     void CloseActiveBeltBagGUI()
     {
-        if (g_activeBeltGUI)
+        BeltBagInventoryGUI* guiToClose = g_activeBeltGUI;
+        ResetBeltGUIStateOnly();
+
+        if (guiToClose && !IsWorldTransitioning())
         {
-            g_activeBeltGUI->show(false);
-            g_activeBeltGUI->Destroy();
-            g_activeBeltGUI = NULL;
+            guiToClose->show(false);
+            guiToClose->Destroy();
         }
-        g_activeBeltBag = NULL;
-        g_parentCharGUI = NULL;
     }
 
     bool IsAllowedBeltContainer(Item* item)
@@ -119,10 +296,16 @@ namespace
 
     void ApplyStackBonusToBeltBag(ContainerItem* beltBag)
     {
-        if (!beltBag || !beltBag->getInventory())
+        if (!beltBag || IsWorldTransitioning())
             return;
 
-        lektor<InventorySection*>& sections = beltBag->getInventory()->getAllSections();
+        Inventory* bagInv = beltBag->getInventory();
+        if (!bagInv)
+            return;
+
+        TrackBeltInventory(bagInv);
+
+        lektor<InventorySection*>& sections = bagInv->getAllSections();
         for (unsigned int i = 0; i < sections.size(); ++i)
         {
             if (sections[i])
@@ -132,55 +315,45 @@ namespace
         }
     }
 
-    ContainerItem* FindBeltContainerOnCharacter(Character* character)
+    ContainerItem* FindBeltContainerInInventory(const Inventory* inv)
     {
-        if (!character)
+        if (!inv || IsWorldTransitioning())
             return NULL;
 
-        Inventory* inv = character->getInventory();
-        if (!inv)
-            return NULL;
-
-        InventorySection* beltSection = inv->getSectionOfType(ATTACH_BELT);
-        if (!beltSection)
+        Inventory* ncInv = const_cast<Inventory*>(inv);
+        InventorySection* beltSection = ncInv->getSectionOfType(ATTACH_BELT);
+        if (!beltSection || !beltSection->getEnabled())
             return NULL;
 
         const Ogre::vector<InventorySection::SectionItem>::type& items = beltSection->getItems();
         for (size_t i = 0; i < items.size(); ++i)
         {
             Item* item = items[i].item;
-            if (IsAllowedBeltContainer(item))
+            if (item && IsAllowedBeltContainer(item))
             {
                 ContainerItem* bag = static_cast<ContainerItem*>(item);
-                ApplyStackBonusToBeltBag(bag);
-                return bag;
+                Inventory* bagInv = bag->getInventory();
+                if (bagInv && bagInv != inv)
+                {
+                    TrackBeltInventory(bagInv);
+                    return bag;
+                }
             }
         }
         return NULL;
     }
 
-    bool IsInventoryOwnedByBeltBag(const Inventory* inv)
+    ContainerItem* FindBeltContainerOnCharacter(Character* character)
     {
-        if (!inv)
-            return false;
+        if (!character || IsWorldTransitioning())
+            return NULL;
 
-        if (g_activeBeltBag && g_activeBeltBag->getInventory() == inv)
-            return true;
-
-        Inventory* ncInv = const_cast<Inventory*>(inv);
-        RootObject* owner = ncInv->getOwner();
-        if (owner)
-        {
-            Item* asItem = dynamic_cast<Item*>(owner);
-            if (asItem && IsAllowedBeltContainer(asItem) && asItem->slotType == ATTACH_BELT)
-                return true;
-        }
-        return false;
+        return FindBeltContainerInInventory(character->getInventory());
     }
 
     void ToggleBeltBagWindow(InventoryGUI* parentGUI, ContainerItem* beltBag)
     {
-        if (!parentGUI || !beltBag || !beltBag->getInventory())
+        if (IsWorldTransitioning() || !parentGUI || !beltBag || !beltBag->getInventory())
             return;
 
         if (g_activeBeltGUI && g_activeBeltBag == beltBag)
@@ -313,12 +486,53 @@ namespace
         return true;
     }
 
+    // --- PROTECCION DURANTE RESET Y CARGA DE PARTIDA ---
+
+    void (*ClearAllOriginal)(Inventory*, bool, bool) = NULL;
+    void ClearAllHook(Inventory* self, bool destroy, bool skipUnique)
+    {
+        HookScope scope("ClearAllHook");
+        ResetBeltGUIStateOnly();
+
+        InterlockedIncrement(&g_worldTransitionDepth);
+        if (ClearAllOriginal)
+            ClearAllOriginal(self, destroy, skipUnique);
+        InterlockedDecrement(&g_worldTransitionDepth);
+    }
+
+    void (*LoadFromSaveStateOriginal)(Inventory*, GameSaveState*) = NULL;
+    void LoadFromSaveStateHook(Inventory* self, GameSaveState* state)
+    {
+        HookScope scope("LoadFromSaveStateHook");
+        ResetBeltGUIStateOnly();
+        ClearTrackedBeltInventories();
+
+        InterlockedIncrement(&g_worldTransitionDepth);
+        if (LoadFromSaveStateOriginal)
+            LoadFromSaveStateOriginal(self, state);
+        InterlockedDecrement(&g_worldTransitionDepth);
+    }
+
+    void (*LoadFromContainerOriginal)(Inventory*, GameDataContainer*, GameData*) = NULL;
+    void LoadFromContainerHook(Inventory* self, GameDataContainer* container, GameData* inventoryState)
+    {
+        HookScope scope("LoadFromContainerHook");
+        ResetBeltGUIStateOnly();
+        ClearTrackedBeltInventories();
+
+        InterlockedIncrement(&g_worldTransitionDepth);
+        if (LoadFromContainerOriginal)
+            LoadFromContainerOriginal(self, container, inventoryState);
+        InterlockedDecrement(&g_worldTransitionDepth);
+    }
+
     // --- HOOKS DE INTERFAZ Y APILADO ---
 
     void (*RClickAutoEquippingOriginal)(InventoryGUI*) = NULL;
     void RClickAutoEquippingHook(InventoryGUI* self)
     {
-        if (self)
+        HookScope scope("RClickAutoEquippingHook");
+        if (self && !IsWorldTransitioning())
         {
             Character* ch = self->getCallbackCharacter();
             if (ch && self->getInventory() == ch->getInventory())
@@ -339,6 +553,7 @@ namespace
     void (*InventoryShowOriginal)(InventoryGUI*, bool) = NULL;
     void InventoryShowHook(InventoryGUI* self, bool on)
     {
+        HookScope scope("InventoryShowHook");
         if (InventoryShowOriginal)
             InventoryShowOriginal(self, on);
 
@@ -351,10 +566,11 @@ namespace
     void (*InventoryUpdateOriginal)(InventoryGUI*) = NULL;
     void InventoryUpdateHook(InventoryGUI* self)
     {
+        HookScope scope("InventoryUpdateHook");
         if (InventoryUpdateOriginal)
             InventoryUpdateOriginal(self);
 
-        if (self && self == g_parentCharGUI && g_activeBeltGUI)
+        if (!IsWorldTransitioning() && self && self == g_parentCharGUI && g_activeBeltGUI)
         {
             Character* ch = self->getCallbackCharacter();
             ContainerItem* currentBeltBag = FindBeltContainerOnCharacter(ch);
@@ -364,6 +580,7 @@ namespace
             }
             else
             {
+                g_activeBeltGUI->refreshSection();
                 g_activeBeltGUI->update();
             }
         }
@@ -372,7 +589,8 @@ namespace
     bool (*IsWithinRangeToTradeOriginal)(InventoryGUI*, RootObject*, bool) = NULL;
     bool IsWithinRangeToTradeHook(InventoryGUI* self, RootObject* otherOwner, bool stealing)
     {
-        if (self && g_activeBeltGUI && (self == g_activeBeltGUI || self == g_parentCharGUI))
+        HookScope scope("IsWithinRangeToTradeHook");
+        if (!IsWorldTransitioning() && self && g_activeBeltGUI && (self == g_activeBeltGUI || self == g_parentCharGUI))
         {
             if (otherOwner == g_activeBeltBag ||
                 (g_parentCharGUI && otherOwner == g_parentCharGUI->getCallbackObject()))
@@ -386,38 +604,15 @@ namespace
             : true;
     }
 
-    void (*SectionAddItemCbOriginal)(Inventory*, Item*) = NULL;
-    void SectionAddItemCbHook(Inventory* self, Item* item)
-    {
-        if (SectionAddItemCbOriginal)
-            SectionAddItemCbOriginal(self, item);
-        RefreshActiveBeltGUI(self);
-    }
-
-    void (*SectionUpdateItemCbOriginal)(Inventory*, Item*, int) = NULL;
-    void SectionUpdateItemCbHook(Inventory* self, Item* item, int unk)
-    {
-        if (SectionUpdateItemCbOriginal)
-            SectionUpdateItemCbOriginal(self, item, unk);
-        RefreshActiveBeltGUI(self);
-    }
-
-    void (*SectionRemoveItemCbOriginal)(Inventory*, Item*) = NULL;
-    void SectionRemoveItemCbHook(Inventory* self, Item* item)
-    {
-        if (SectionRemoveItemCbOriginal)
-            SectionRemoveItemCbOriginal(self, item);
-        RefreshActiveBeltGUI(self);
-    }
-
     int (*ApplyStackingBonusesOriginal)(const InventorySection*, int) = NULL;
     int ApplyStackingBonusesHook(const InventorySection* self, int normalStackableAmount)
     {
+        HookScope scope("ApplyStackingBonusesHook");
         int res = ApplyStackingBonusesOriginal
             ? ApplyStackingBonusesOriginal(self, normalStackableAmount)
             : normalStackableAmount;
 
-        if (self && g_beltMaxStack > 1 && IsInventoryOwnedByBeltBag(self->getInventory()))
+        if (!IsWorldTransitioning() && self && g_beltMaxStack > 1 && IsTrackedBeltInventory(self->getInventory()))
         {
             if (normalStackableAmount >= 1 && res < g_beltMaxStack)
                 return g_beltMaxStack;
@@ -430,23 +625,20 @@ namespace
     bool (*HasRoomForItemOriginal)(Inventory*, GameData*) = NULL;
     bool HasRoomForItemHook(Inventory* self, GameData* itemData)
     {
-        if (self && itemData && !t_routingBeltFood && Item::isFood(itemData))
+        HookScope scope("HasRoomForItemHook");
+        if (!IsWorldTransitioning() && self && itemData && !t_routingBeltFood && Item::isFood(itemData))
         {
-            Character* owner = self->getCallbackCharacter();
-            if (owner && self == owner->getInventory())
+            ContainerItem* beltBag = FindBeltContainerInInventory(self);
+            if (beltBag && beltBag->getInventory())
             {
-                ContainerItem* beltBag = FindBeltContainerOnCharacter(owner);
-                if (beltBag && beltBag->getInventory() && beltBag->getInventory() != self)
-                {
-                    t_routingBeltFood = true;
-                    bool beltHasRoom = HasRoomForItemOriginal
-                        ? HasRoomForItemOriginal(beltBag->getInventory(), itemData)
-                        : false;
-                    t_routingBeltFood = false;
+                t_routingBeltFood = true;
+                bool beltHasRoom = HasRoomForItemOriginal
+                    ? HasRoomForItemOriginal(beltBag->getInventory(), itemData)
+                    : false;
+                t_routingBeltFood = false;
 
-                    if (beltHasRoom)
-                        return true;
-                }
+                if (beltHasRoom)
+                    return true;
             }
         }
 
@@ -458,25 +650,22 @@ namespace
     bool (*TryAddItemOriginal)(Inventory*, Item*, int) = NULL;
     bool TryAddItemHook(Inventory* self, Item* item, int quantity)
     {
-        if (self && item && !t_routingBeltFood && item->getGameData() && Item::isFood(item->getGameData()))
+        HookScope scope("TryAddItemHook");
+        if (!IsWorldTransitioning() && self && item && !t_routingBeltFood && item->getGameData() && Item::isFood(item->getGameData()))
         {
-            Character* owner = self->getCallbackCharacter();
-            if (owner && self == owner->getInventory())
+            ContainerItem* beltBag = FindBeltContainerInInventory(self);
+            if (beltBag && beltBag->getInventory())
             {
-                ContainerItem* beltBag = FindBeltContainerOnCharacter(owner);
-                if (beltBag && beltBag->getInventory() && beltBag->getInventory() != self)
-                {
-                    t_routingBeltFood = true;
-                    bool added = TryAddItemOriginal
-                        ? TryAddItemOriginal(beltBag->getInventory(), item, quantity)
-                        : false;
-                    t_routingBeltFood = false;
+                t_routingBeltFood = true;
+                bool added = TryAddItemOriginal
+                    ? TryAddItemOriginal(beltBag->getInventory(), item, quantity)
+                    : false;
+                t_routingBeltFood = false;
 
-                    if (added)
-                    {
-                        RefreshActiveBeltGUI(beltBag->getInventory());
-                        return true;
-                    }
+                if (added)
+                {
+                    RefreshActiveBeltGUI(beltBag->getInventory());
+                    return true;
                 }
             }
         }
@@ -486,47 +675,16 @@ namespace
             : false;
     }
 
-    bool (*AddItemOriginal)(Inventory*, Item*, int, bool, bool) = NULL;
-    bool AddItemHook(Inventory* self, Item* item, int quantity, bool dropOnFail, bool destroyOnFail)
-    {
-        if (self && item && !t_routingBeltFood && item->getGameData() && Item::isFood(item->getGameData()))
-        {
-            Character* owner = self->getCallbackCharacter();
-            if (owner && self == owner->getInventory())
-            {
-                ContainerItem* beltBag = FindBeltContainerOnCharacter(owner);
-                if (beltBag && beltBag->getInventory() && beltBag->getInventory() != self)
-                {
-                    t_routingBeltFood = true;
-                    // Intentar primero sin tirar al suelo ni destruir si no cabe en la cangurera
-                    bool added = AddItemOriginal
-                        ? AddItemOriginal(beltBag->getInventory(), item, quantity, false, false)
-                        : false;
-                    t_routingBeltFood = false;
-
-                    if (added)
-                    {
-                        RefreshActiveBeltGUI(beltBag->getInventory());
-                        return true;
-                    }
-                }
-            }
-        }
-
-        return AddItemOriginal
-            ? AddItemOriginal(self, item, quantity, dropOnFail, destroyOnFail)
-            : false;
-    }
-
     // --- HOOKS DE ALIMENTACION Y DESTRUCCION DEL PLATO VACIO ---
 
     bool (*RemoveItemAutoDestroyOriginal)(Inventory*, Item*, int) = NULL;
     bool RemoveItemAutoDestroyHook(Inventory* self, Item* it, int howmany)
     {
-        if (self && it && !self->hasItem(it))
+        HookScope scope("RemoveItemAutoDestroyHook");
+        if (!IsWorldTransitioning() && self && it && it->chargesLeft <= 0.001f &&
+            it->getGameData() && Item::isFood(it->getGameData()) && !self->hasItem(it))
         {
-            Character* owner = self->getCallbackCharacter();
-            ContainerItem* beltBag = FindBeltContainerOnCharacter(owner);
+            ContainerItem* beltBag = FindBeltContainerInInventory(self);
             if (beltBag && beltBag->getInventory() && beltBag->getInventory()->hasItem(it))
             {
                 bool removed = RemoveItemAutoDestroyOriginal
@@ -549,20 +707,16 @@ namespace
     Item* (*InternalGetBestFoodItemOriginal)(const Inventory*, ItemFunction, Character*) = NULL;
     Item* InternalGetBestFoodItemHook(const Inventory* self, ItemFunction type, Character* race)
     {
+        HookScope scope("InternalGetBestFoodItemHook");
         Item* food = InternalGetBestFoodItemOriginal ? InternalGetBestFoodItemOriginal(self, type, race) : NULL;
         if (food && food->chargesLeft <= 0.001f)
             food = NULL;
 
-        if (food || t_searchingBeltFood || !self)
+        if (food || t_searchingBeltFood || IsWorldTransitioning() || !self)
             return food;
 
-        Character* owner = self->getCallbackCharacter();
-        if (!owner) owner = race;
-        if (!owner || self != owner->getInventory())
-            return NULL;
-
-        ContainerItem* beltBag = FindBeltContainerOnCharacter(owner);
-        if (beltBag && beltBag->getInventory() && beltBag->getInventory() != self)
+        ContainerItem* beltBag = FindBeltContainerInInventory(self);
+        if (beltBag && beltBag->getInventory())
         {
             t_searchingBeltFood = true;
             food = InternalGetBestFoodItemOriginal
@@ -583,17 +737,13 @@ namespace
     int (*InternalGetNumFoodItemsOriginal)(const Inventory*, ItemFunction, Character*) = NULL;
     int InternalGetNumFoodItemsHook(const Inventory* self, ItemFunction type, Character* race)
     {
+        HookScope scope("InternalGetNumFoodItemsHook");
         int count = InternalGetNumFoodItemsOriginal ? InternalGetNumFoodItemsOriginal(self, type, race) : 0;
-        if (t_searchingBeltFood || !self)
+        if (t_searchingBeltFood || IsWorldTransitioning() || !self)
             return count;
 
-        Character* owner = self->getCallbackCharacter();
-        if (!owner) owner = race;
-        if (!owner || self != owner->getInventory())
-            return count;
-
-        ContainerItem* beltBag = FindBeltContainerOnCharacter(owner);
-        if (beltBag && beltBag->getInventory() && beltBag->getInventory() != self)
+        ContainerItem* beltBag = FindBeltContainerInInventory(self);
+        if (beltBag && beltBag->getInventory())
         {
             t_searchingBeltFood = true;
             count += InternalGetNumFoodItemsOriginal
@@ -609,11 +759,12 @@ namespace
     CraftingItem* (*AddCraftOriginal)(CraftingBuilding*, GameData*, GameData*, float, YesNoMaybe) = NULL;
     CraftingItem* AddCraftHook(CraftingBuilding* self, GameData* basedata, GameData* matdata, float progress, YesNoMaybe crit)
     {
+        HookScope scope("AddCraftHook");
         CraftingItem* created = AddCraftOriginal
             ? AddCraftOriginal(self, basedata, matdata, progress, crit)
             : NULL;
 
-        if (created)
+        if (created && !IsWorldTransitioning())
         {
             float baseHours = (created->endTime > 0.01f) ? created->endTime : g_minCraftHours;
             created->endTime = baseHours * g_craftTimeMultiplier;
@@ -624,6 +775,7 @@ namespace
     void (*CraftingOperateOriginal)(CraftingBuilding*, Character*, float) = NULL;
     void CraftingOperateHook(CraftingBuilding* self, Character* worker, float amount)
     {
+        HookScope scope("CraftingOperateHook");
         if (g_craftTimeMultiplier > 0.01f && g_craftTimeMultiplier != 1.0f)
         {
             amount /= g_craftTimeMultiplier;
@@ -636,6 +788,7 @@ namespace
     void (*CharSelectOriginal)(Character*) = NULL;
     void CharSelectHook(Character* ch)
     {
+        HookScope scope("CharSelectHook");
         if (CharSelectOriginal)
             CharSelectOriginal(ch);
         EnsureRegistered();
@@ -644,6 +797,26 @@ namespace
 
 __declspec(dllexport) void startPlugin()
 {
+    if (!g_vehHandle)
+    {
+        g_vehHandle = AddVectoredExceptionHandler(1, VectoredCrashLogger);
+    }
+
+    KenshiLib::AddHook(
+        KenshiLib::GetRealAddress(&Inventory::clearAll),
+        &ClearAllHook,
+        &ClearAllOriginal);
+
+    KenshiLib::AddHook(
+        KenshiLib::GetRealAddress(static_cast<void (Inventory::*)(GameSaveState*)>(&Inventory::loadFrom)),
+        &LoadFromSaveStateHook,
+        &LoadFromSaveStateOriginal);
+
+    KenshiLib::AddHook(
+        KenshiLib::GetRealAddress(static_cast<void (Inventory::*)(GameDataContainer*, GameData*)>(&Inventory::loadFrom)),
+        &LoadFromContainerHook,
+        &LoadFromContainerOriginal);
+
     KenshiLib::AddHook(
         KenshiLib::GetRealAddress(&InventoryGUI::rightClickAutoEquipping),
         &RClickAutoEquippingHook,
@@ -665,21 +838,6 @@ __declspec(dllexport) void startPlugin()
         &IsWithinRangeToTradeOriginal);
 
     KenshiLib::AddHook(
-        KenshiLib::GetRealAddress(&Inventory::_NV__sectionAddItemCallback),
-        &SectionAddItemCbHook,
-        &SectionAddItemCbOriginal);
-
-    KenshiLib::AddHook(
-        KenshiLib::GetRealAddress(&Inventory::_NV__sectionUpdateItemCallback),
-        &SectionUpdateItemCbHook,
-        &SectionUpdateItemCbOriginal);
-
-    KenshiLib::AddHook(
-        KenshiLib::GetRealAddress(&Inventory::_NV__sectionRemoveItemCallback),
-        &SectionRemoveItemCbHook,
-        &SectionRemoveItemCbOriginal);
-
-    KenshiLib::AddHook(
         KenshiLib::GetRealAddress(&InventorySection::applyStackingBonuses),
         &ApplyStackingBonusesHook,
         &ApplyStackingBonusesOriginal);
@@ -693,11 +851,6 @@ __declspec(dllexport) void startPlugin()
         KenshiLib::GetRealAddress(&Inventory::_NV_tryAddItem),
         &TryAddItemHook,
         &TryAddItemOriginal);
-
-    KenshiLib::AddHook(
-        KenshiLib::GetRealAddress(&Inventory::_NV_addItem),
-        &AddItemHook,
-        &AddItemOriginal);
 
     KenshiLib::AddHook(
         KenshiLib::GetRealAddress(&Inventory::_NV_removeItemAutoDestroy),
